@@ -14,7 +14,7 @@ Everything runs in simulation. The Brain only outputs (v, w) so the same code ca
 Detectors: yoloworld (open-vocabulary AI, needs internet once) | color (offline classical CV) | gt (debug oracle)
 Keys: q quit | n new random room | space pause.   Type a new command in the terminal any time.
 """
-import argparse, colorsys, csv, heapq, json, math, os, random, re, shutil, sys, threading, time
+import argparse, colorsys, csv, heapq, json, math, os, random, re, shutil, sys, tempfile, threading, time
 from dataclasses import dataclass
 import cv2
 import numpy as np
@@ -35,6 +35,7 @@ VIS_R = 3.0                              # how far the camera is trusted to spot
 ANGS = [math.radians(a) for a in range(-80, 81, 20)]   # 9 range sensors (hardware: servo-swept ultrasonic)
 SUBA = [math.radians(a) for a in (-8, -4, 0, 4, 8)]    # each sensor has a ~16 deg beam, like a real ultrasonic
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+EXP_D0, EXP_DK, EXP_P = (float(os.environ.get(k, v)) for k, v in (('EXP_D0', 25), ('EXP_DK', 45), ('EXP_P', 1.15)))   # viewpoint score = gain / (D0 + DK * path_m ** P)
 
 @dataclass
 class Safety:
@@ -669,6 +670,7 @@ class WorldMap:
         self.sfree = np.zeros((MN, MN), np.uint8)          # how often the sonar has seen this cell EMPTY
         self.visits = np.zeros((MN, MN), np.float32)
         self.tg, self.sweep, self.bad, self.neg, self.sus = {}, 1, [], {}, {}
+        self.room = None
         self.dist = self.prev = None
         k = np.arange(1, 24)                                                      # rays used to estimate "what would I see from there"
         th = np.linspace(0, 2 * math.pi, 48, endpoint=False)
@@ -757,12 +759,51 @@ class WorldMap:
                 c["w"] += w
                 c["n"] += 1
                 c["t"] = t
+                if d < 1.5:
+                    c["miss"] = 0                               # seen again from close up: it is really there
                 return
-        self.tg[label].append(dict(x=x, y=y, w=w, n=1, t=t))
+        self.tg[label].append(dict(x=x, y=y, w=w, n=1, t=t, miss=0, ver=False))
 
-    def recall(self, label, min_n=3):
-        cs = [c for c in self.tg.get(label, []) if c["n"] >= min_n]
-        return max(cs, key=lambda c: (c["n"], c["t"])) if cs else None
+    def pick_recall(self, label, x, y, yaw, min_n=3, escape=False):
+        """Which remembered spot to drive to for `label`, and the optimised A* route to it.
+        Ranking (NOT 'whoever was seen in the most frames' - staring at a false alarm piles up frames):
+        1. spots that never failed a visit  2. spots where we really arrived and verified the object
+        3. confidence bucket (many sightings)  4. shortest A* route (time cost). Returns (cluster, goal, path, margin)."""
+        best = None
+        for c in self.tg.get(label, []):
+            if c["n"] < min_n:
+                continue
+            goal = self.goal_near(x, y, c["x"], c["y"], escape=escape)
+            path, m = self.route((x, y), yaw, goal, escape) if goal else (None, None)
+            if not path:
+                continue
+            length = sum(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(path, path[1:]))
+            bucket = 0 if c["n"] >= 6 else 1 if c["n"] >= 4 else 2
+            key = (c.get("miss", 0), 0 if c.get("ver") else 1, bucket, length)
+            if best is None or key < best[0]:
+                best = (key, c, goal, path, m)
+        return best[1:] if best else None
+
+    def verify(self, label, x, y):
+        """The car really got to the object and the judge confirmed it: this spot is the truth now."""
+        for c in self.tg.get(label, []):
+            if math.hypot(c["x"] - x, c["y"] - y) < 1.0:
+                c["x"], c["y"], c["ver"], c["miss"] = x, y, True, 0
+                c["n"] = max(c["n"], 8)
+                return
+        self.tg.setdefault(label, []).append(dict(x=x, y=y, w=4.0, n=8, t=0.0, miss=0, ver=True))
+
+    def miss(self, label, c, hard=False):
+        """A visit to this remembered spot found nothing. First time: keep it but try other spots first.
+        Second time (or unreachable): it has moved or was a false alarm - forget it."""
+        c["miss"] = c.get("miss", 0) + (2 if hard else 1)
+        if c["miss"] >= 2:
+            self.forget(label, c["x"], c["y"])
+            return True
+        return False
+
+    def reset_objects(self):
+        self.tg, self.sus, self.neg, self.bad = {}, {}, {}, []
 
     def reject(self, label, x, y):
         """Remember a FALSE ALARM: something that looked like `label` from afar but failed the close-up check."""
@@ -959,14 +1000,16 @@ class WorldMap:
         return min(hard, max(clear_here - .03, .08)) if clear_here < hard else hard
 
     @staticmethod
-    def margins():
-        """Safety margins to try, biggest first. The smaller ones are only used when nothing else gets through."""
-        return (SAFE.hard, .5 * (SAFE.hard + SAFE.robot_r + .03), SAFE.robot_r + .03)
+    def margins(escape=False):
+        """Safety margins to try, biggest first. The smaller ones are only used when nothing else gets through.
+        escape=True adds the bare body radius: ONLY for getting out of a pocket, never for everyday routes."""
+        m = (SAFE.hard, .5 * (SAFE.hard + SAFE.robot_r + .03), SAFE.robot_r + .03)
+        return m + (SAFE.robot_r,) if escape else m
 
-    def route(self, start, yaw, goal):
+    def route(self, start, yaw, goal, escape=False):
         """Best safe route. If the full safety margin leaves no way through, squeeze: retry with smaller margins,
         never below body radius + a little. Returns (path, margin_used) or (None, None)."""
-        for m in self.margins():
+        for m in self.margins(escape):
             p_ = self.astar(start, goal, yaw, hard=m)
             if p_:
                 return p_, self._hard_eff
@@ -983,9 +1026,9 @@ class WorldMap:
         new = los & ~self.seen[iy, ix] & ~hit
         return (new * self.rw[None, None, :]).sum(axis=(1, 2))
 
-    def best_viewpoint(self, x, y, yaw=0.0):
+    def best_viewpoint(self, x, y, yaw=0.0, escape=False):
         """Pick where to go next: lots of unsearched floor visible from there, and not too far to drive."""
-        for m in self.margins():                          # try the comfortable margin first; squeeze only if it finds nothing
+        for m in self.margins(escape):                    # try the comfortable margin first; squeeze only if it finds nothing
             self.plan_from(x, y, hard=m)
             rr, cc = np.meshgrid(np.arange(1, MN - 1, 3), np.arange(1, MN - 1, 3), indexing="ij")
             rr, cc = rr.ravel(), cc.ravel()
@@ -998,7 +1041,7 @@ class WorldMap:
                 continue
             g = self.gain_at(rr, cc)
             d = self.dist[rr, cc]
-            score = g / (60.0 + 25.0 * d)
+            score = g / (EXP_D0 + EXP_DK * d ** EXP_P)
             score[g < MIN_GAIN] = -1
             for i in np.argsort(-score)[:25]:             # best candidates first: the first one A* can really reach wins
                 if score[i] <= 0:
@@ -1025,17 +1068,22 @@ class WorldMap:
         r, c = self.cell(x, y)
         return float(self.gain_at(np.array([r]), np.array([c]))[0])
 
-    def goal_near(self, x, y, tx, ty, lo_r=.7, hi_r=1.4):
+    def goal_near(self, x, y, tx, ty, lo_r=.7, hi_r=1.4, escape=False):
         """A reachable floor cell 0.7-1.4 m from a remembered object (we stop short of it, then look)."""
-        self.plan_from(x, y)
+        self.plan_from(x, y, hard=SAFE.robot_r if escape else None)
         rr, cc = np.meshgrid(np.arange(1, MN - 1), np.arange(1, MN - 1), indexing="ij")
         dd = np.hypot((cc + .5) * MRES - HALF - tx, (rr + .5) * MRES - HALF - ty)
-        ok = (dd >= lo_r) & (dd <= hi_r) & (self.dist[rr, cc] < 1e8)
-        if not ok.any():
-            return None
+        reach = self.dist[rr, cc] < 1e8
+        ok = (dd >= lo_r) & (dd <= hi_r) & reach
+        if not ok.any():                                   # the ring is walled off: get as CLOSE as the map allows, then
+            ok = (dd >= lo_r) & (dd <= 3.5) & reach        # the camera + sonar approach finishes the last stretch
+            if not ok.any():
+                return None
+            r, c = np.unravel_index(int(np.argmin(np.where(ok, dd, 1e9))), dd.shape)
+            return self.centre(int(r) + 1, int(c) + 1)
         cost = np.where(ok, self.dist[rr, cc], 1e9)
         r, c = np.unravel_index(int(np.argmin(cost)), cost.shape)
-        return self.centre(int(r), int(c))
+        return self.centre(int(r) + 1, int(c) + 1)           # (+1: the grids above start at cell 1)
 
     # ---- saving the map, vision hazards, reporting
     def update_vision(self, pose, hazards):
@@ -1046,16 +1094,22 @@ class WorldMap:
             r, c = self.cell(cx + d * math.cos(yaw + b), cy + d * math.sin(yaw + b))
             self.vis[r, c] = min(3.0, self.vis[r, c] + .5)
 
-    def save(self, path):
-        np.savez_compressed(path, lo=self.lo, seen=self.seen, visits=self.visits,
-                            meta=json.dumps(dict(tg=self.tg, neg=self.neg, sweep=self.sweep)))
+    def save(self, path, room=None):
+        """Write map + object locations + obstacles. Written to a temp name first so a crash never leaves a half file."""
+        tmp = path + ".part.npz"
+        np.savez_compressed(tmp, lo=self.lo, seen=self.seen, visits=self.visits, vis=self.vis, sfree=self.sfree,
+                            meta=json.dumps(dict(tg=self.tg, neg=self.neg, sweep=self.sweep, room=room)))
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path):
         z = np.load(path, allow_pickle=False)
         wm = cls()
         wm.lo, wm.seen, wm.visits = z["lo"].astype(np.float32), z["seen"].astype(bool), z["visits"].astype(np.float32)
+        if "vis" in z.files:
+            wm.vis, wm.sfree = z["vis"].astype(np.float32), z["sfree"].astype(wm.sfree.dtype)
         meta = json.loads(str(z["meta"]))
+        wm.room = meta.get("room")
         wm.tg, wm.neg, wm.sweep = meta["tg"], {k: [tuple(v) for v in vs] for k, vs in meta["neg"].items()}, meta["sweep"]
         return wm
 
@@ -1081,8 +1135,10 @@ class Brain:
 
     def reset(self):
         self.path, self.goal, self.go_t, self.go_pos, self.blocked_n = [], None, 0.0, (0, 0), 0
+        self.go_yaw, self.stuck_why = 0.0, ""
         self.replans, self.route_margin, self.replan_why, self.last_pt = 0, SAFE.hard, "", None
         self.rc_pending, self.recall_block, self.last_replan, self.spin_ok = None, -1.0, -99.0, False
+        self.last_pick, self.look_t0, self.look_hold, self.recall_retry = -99.0, 0.0, None, 0
         self.state, self.note = "SEARCH", "starting"
         self.seen, self.lost, self.tracked, self.hist = 0, 999, False, []
         self.goal_yaw = None
@@ -1197,6 +1253,7 @@ class Brain:
     def _set_route(self, path, goal, margin, now, pose):
         self.path, self.goal, self.route_margin = path, goal, margin
         self.go_t, self.go_pos, self.blocked_n, self.last_replan, self.last_pt = now, pose[:2], 0, now, tuple(pose[:2])
+        self.go_yaw = pose[2]
 
     def _replan(self, pose, now, why):
         """New A* route to the SAME goal from where the car is now, starting with its current heading (no needless U-turn)."""
@@ -1206,7 +1263,7 @@ class Brain:
         if path is None:
             return False
         self.path, self.route_margin, self.replans, self.replan_why = path, m, self.replans + 1, why
-        self.go_t, self.go_pos, self.last_pt = now, (x, y), (x, y)
+        self.go_t, self.go_pos, self.last_pt, self.go_yaw = now, (x, y), (x, y), yaw
         return True
 
     @staticmethod
@@ -1241,11 +1298,13 @@ class Brain:
                 if self._replan(pose, now, why):
                     pts = self.path
                 else:
+                    self.stuck_why = f"no route after: {why}"
                     return 0.0, 0.0, "stuck"
         if now - self.go_t > 4.0:                           # progress watchdog
-            if math.hypot(x - self.go_pos[0], y - self.go_pos[1]) < .25:
-                return 0.0, 0.0, "stuck"
-            self.go_t, self.go_pos = now, (x, y)
+            if math.hypot(x - self.go_pos[0], y - self.go_pos[1]) < .25 and abs(wrap(yaw - self.go_yaw)) < .6:
+                self.stuck_why = "no progress for 4 s"
+                return 0.0, 0.0, "stuck"                    # (turning in place IS progress; only no move AND no turn is stuck)
+            self.go_t, self.go_pos, self.go_yaw = now, (x, y), yaw
         look = next((q for q in pts if math.hypot(q[0] - x, q[1] - y) >= .6), pts[-1])
         g = wrap(math.atan2(look[1] - y, look[0] - x) - yaw)
         self.state = "EXPLORE"
@@ -1257,6 +1316,7 @@ class Brain:
         if self.blocked_n > 6:
             self.blocked_n = 0
             if not self._replan(pose, now, "blocked"):
+                self.stuck_why = "blocked, no alternative route"
                 return 0.0, 0.0, "stuck"
         left = sum(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(pts, pts[1:]))
         self.note = f"{label}: {left:.1f} m to go | explored {wm.pct():.0f}% | replans {self.replans}"
@@ -1265,41 +1325,59 @@ class Brain:
     def _search_map(self, rng, pose, now):
         x, y, yaw = pose
         wm = self.wm
-        rc = wm.recall(self.key) if (self.key and not self.map_only and now >= self.recall_block) else None
-        if rc is not None and self.phase != "SPIN":         # the map remembers where it is: go there by the best route
-            moved = self.rc_pending is not None and math.hypot(rc["x"] - self.rc_pending[0], rc["y"] - self.rc_pending[1]) > .7
-            if self.phase != "RECALL" or moved:             # (also re-aims if the object was seen somewhere new)
-                goal = wm.goal_near(x, y, rc["x"], rc["y"])
-                path, m = wm.route((x, y), yaw, goal) if goal else (None, None)
-                if path:
-                    self.phase, self.rc_pending = "RECALL", (rc["x"], rc["y"])
-                    self._set_route(path, goal, m, now, pose)
-                else:
-                    wm.forget(self.key, rc["x"], rc["y"])
-        elif rc is None and self.phase == "RECALL":
-            self.rc_pending, self.phase, self.prev_yaw = None, "PLAN", None
+        # ---- the map remembers where this object was: go there by the best route (no re-scan)
+        if (self.key and not self.map_only and now >= self.recall_block and self.phase in ("PLAN", "GO")
+                and now - self.last_pick > (0.0 if self.phase == "PLAN" else 3.0)):
+            self.last_pick = now
+            pick = wm.pick_recall(self.key, x, y, yaw) or wm.pick_recall(self.key, x, y, yaw, escape=True)
+            if pick:
+                c, goal, path, m = pick
+                self.rc_pending, self.phase = c, "RECALL"
+                self._set_route(path, goal, m, now, pose)
         if self.phase == "RECALL":
+            c = self.rc_pending
+            if c is None or c not in wm.tg.get(self.key, []):       # memory changed under us (merged / forgotten)
+                self.rc_pending, self.phase = None, "PLAN"
+                return 0.0, 0.0
             v, w, st = self._follow(pose, rng, now, "going to where I saw it")
             self.state = "RECALL"
             if st == "go":
                 return v, w
             if st == "stuck":
-                wm.forget(self.key, *self.rc_pending)
-                self.rc_pending, self.phase, self.prev_yaw = None, "PLAN", None
-                return 0.0, 0.0
-            self.phase, self.prev_yaw = "SPIN", None        # arrived: look around to confirm
-        if self.phase == "SPIN" and self.prev_yaw is None and not self.spin_ok:
-            r_, c_ = wm.cell(x, y)
-            if wm.clearance_any()[r_, c_] < SAFE.robot_r + .10 or min(rng) < .15:   # turning here would swing the body into something
-                fr = wm.nearest_roomy(x, y, yaw)
-                if fr:
-                    self._set_route(fr[0], fr[1], fr[2], now, pose)
-                    self.phase = "FREE"
-                else:
-                    wm.bad.append((x, y))
-                    self.phase = "PLAN"
+                if self.stuck_why.startswith("no route") and self.recall_retry < 3:
+                    self.recall_retry += 1                          # the map changed under the route (a new obstacle, a noisy cell):
+                    self.rc_pending, self.phase, self.last_pick = None, "PLAN", -99.0   # re-plan from HERE, maybe to another spot near it
                     return 0.0, 0.0
-        self.spin_ok = False
+                wm.miss(self.key, c)                                # genuinely cannot get there: try other remembered spots first
+                self.rc_pending, self.phase = None, "PLAN"
+                return 0.0, 0.0
+            self.phase, self.look_t0 = "LOOK", now                  # arrived
+        if self.phase == "LOOK":                                    # face the remembered spot and give the detector a moment
+            c = self.rc_pending
+            e = wrap(math.atan2(c["y"] - y, c["x"] - x) - yaw)
+            self.state, self.note = "SEARCH", "arrived: looking at where I saw it"
+            if abs(e) > .12 and now - self.look_t0 < 4.0:
+                self.look_hold = None
+                return 0.0, float(np.sign(e) * max(.3, min(1.2, 1.8 * abs(e))))
+            if self.look_hold is None:
+                self.look_hold = now
+            if now - self.look_hold < 0.8 + 3 * self.det_period + self.lat_est:
+                return 0.0, 0.0
+            self.look_hold = None
+            self.phase, self.prev_yaw = "SPIN", None
+        if self.phase == "SPIN":
+            if self.prev_yaw is None and not self.spin_ok:
+                r_, c_ = wm.cell(x, y)
+                if wm.clearance_any()[r_, c_] < SAFE.robot_r + .10 or min(rng) < .15:   # turning here would swing the body into something
+                    fr = wm.nearest_roomy(x, y, yaw)
+                    if fr:
+                        self._set_route(fr[0], fr[1], fr[2], now, pose)
+                        self.phase = "FREE"
+                    else:
+                        wm.bad.append((x, y))
+                        self.phase = "PLAN"
+                        return 0.0, 0.0
+            self.spin_ok = False
         if self.phase == "FREE":
             v, w, st = self._follow(pose, rng, now, "moving to a spot with room to turn")
             if st == "go":
@@ -1319,14 +1397,16 @@ class Brain:
             if self.spin_acc < 2 * math.pi:
                 return 0.0, self.spin_w
             wm.bad.append((x, y))                           # looked all around from here: don't pick this spot again
-            if self.rc_pending:                             # looked all around and it is not there any more -> it was moved
-                wm.forget(self.key, *self.rc_pending)
+            if self.rc_pending:                             # looked all around and it is not there
+                if wm.miss(self.key, self.rc_pending):      # second failed visit: it was moved / false alarm
+                    wm.new_sweep()                          # old "already searched" knowledge is stale now
                 self.rc_pending = None
-                wm.new_sweep()                              # old "already searched" knowledge is stale now
             self.phase, self.prev_yaw = "PLAN", None
         if self.phase == "PLAN":
             self.last_replan = now
             best = wm.best_viewpoint(x, y, yaw)
+            if best is None and wm.pct() < 85:               # boxed in? allow the tightest margin, just to get out
+                best = wm.best_viewpoint(x, y, yaw, escape=True)
             if best is None:
                 if self.map_only:
                     self.state, self.note = "MAPPED", f"room mapped: {wm.pct():.0f}% looked at"
@@ -1480,9 +1560,10 @@ class Mission:
     So a late result cannot point the car at where the target *used to be*."""
 
     def __init__(self, sim, detector, key, seed, max_t=300, use_async=False, latency=0.0, explore="map",
-                 mode="find", load_map=None, hazard=True):
+                 mode="find", load_map=None, hazard=True, store=None):
         self.sim, self.det, self.max_t, self.lat, self.explore = sim, detector, max_t, latency, explore
         self.mode, self.pending_map, self.hazard, self.haz_boxes = mode, load_map, hazard, []
+        self.store, self.last_save = store, 0.0         # temporary on-robot storage: survives restarts, wiped by reset_map()
         self.asy = AsyncDetector(detector) if use_async else None
         self.epoch, self.seed = 0, seed
         self.start(key)
@@ -1498,6 +1579,14 @@ class Mission:
         self.wm = None
         if self.explore == "map":
             self.wm = WorldMap.load(self.pending_map) if self.pending_map else WorldMap()
+            if not self.pending_map and self.store and os.path.exists(self.store):
+                try:
+                    old = WorldMap.load(self.store)
+                    if old.room == self.seed:               # only the SAME room's map is valid
+                        self.wm = old
+                except Exception:
+                    pass
+            self.wm.room = self.seed
             self.pending_map = None                         # only the first room can use a saved map
         self.brain = Brain(CATALOG[self.key]["standoff"], self.wm, self.key, map_only=self.mode == "map")
         self.outcome, self.dets, self.tdet, self.last_ranges = None, [], None, [RMAX] * len(ANGS)
@@ -1508,11 +1597,33 @@ class Mission:
         self.run_len, self.last_run = 0, 0
         self.dets_pose, self.lat_ema, self.per_ema, self.last_arr = None, 0.0, DT, 0.0
 
+    def reset_map(self):
+        """Wipe everything the robot remembers about the room (map, obstacles, object locations) and its saved copy."""
+        if self.explore != "map":
+            return
+        self.wm = WorldMap()
+        self.wm.room = self.seed
+        if self.store and os.path.exists(self.store):
+            os.remove(self.store)
+        self.brain = Brain(CATALOG[self.key]["standoff"], self.wm, self.key, map_only=self.mode == "map")
+        self.outcome, self.best_box, self.world_b, self.tgt_xy = None, None, None, None
+
+    def autosave(self, force=False):
+        if self.store and self.wm is not None and (force or self.sim.t - self.last_save >= 5.0):
+            self.last_save = self.sim.t
+            try:
+                self.wm.save(self.store, room=self.seed)
+            except Exception:
+                pass
+
     def retarget(self, key, mode="find"):
         self.key, self.mode = key, mode
         self.brain = Brain(CATALOG[key]["standoff"], self.wm, key, map_only=mode == "map")   # the MAP is kept: it may already know where the new target is
         self.brain.lat_est, self.brain.det_period = self.lat_ema, self.per_ema
+        if self.wm is not None and self.wm.pct() > 5:
+            self.brain.phase = "PLAN"                       # the map already knows the room: plan from it, do not spin first
         self.best_box, self.world_b, self.tgt_xy = None, None, None     # forget detections of the old target
+        self.dets, self.pend, self.run_len, self.last_run = [], None, 0, 0
         self.outcome, self.settle = None, 0
 
     def _observe_all(self, cap_pose, H):
@@ -1626,11 +1737,14 @@ class Mission:
             v = min(v, .15)                          # a person is close: slow right down
         self.cmd = (v, w)
         s.step(v, w, dt)
+        self.autosave()
         if self.outcome is None:
             if self.brain.state == "MAPPED":
                 self.outcome = "MAPPED"
             elif self.brain.state == "ARRIVED":
                 self.outcome = s.judge(self.key)
+                if self.outcome == "SUCCESS" and self.wm is not None and self.tgt_xy is not None:
+                    self.wm.verify(self.key, *self.tgt_xy)      # we stood next to it: this location is now certain
             elif s.t >= self.max_t:
                 self.outcome = "TIMEOUT"
         return frame
@@ -1874,6 +1988,10 @@ def main():
     ap.add_argument("--mode", choices=["find", "map"], default="find", help="map = just map the whole room (no target), find = go find the target")
     ap.add_argument("--save-map", help="write the room map here when mapping finishes (and on key s)")
     ap.add_argument("--load-map", help="start with a map saved earlier: the robot then drives straight to remembered objects")
+    ap.add_argument("--store", default=os.path.join(tempfile.gettempdir(), "robot_map.npz"),
+                    help="temporary on-robot map storage (auto-saved every 5 s, re-loaded on restart for the same room)")
+    ap.add_argument("--no-store", action="store_true", help="do not keep the map between runs")
+    ap.add_argument("--reset-map", action="store_true", help="wipe the stored map before starting")
     ap.add_argument("--novel", action="store_true", help="add odd unfamiliar obstacles (pipe, snowman, sofa...) to test unknown-object avoidance")
     ap.add_argument("--no-hazard", action="store_true", help="turn off the label-free camera hazard layer (sonar only)")
     ap.add_argument("--margin", type=float, help="extra clearance (m) added to the hard safety margin")
@@ -1910,7 +2028,10 @@ def main():
     slow = isinstance(det, (YoloWorldDetector, HybridDetector, TrainedDetector))
     live = not args.headless
     m = Mission(sim, det, key, args.seed, args.max_time, use_async=slow and live, explore=args.explore,
-                mode=args.mode, load_map=args.load_map, hazard=not args.no_hazard)
+                mode=args.mode, load_map=args.load_map, hazard=not args.no_hazard,
+                store=None if args.no_store else args.store)
+    if args.reset_map:
+        m.reset_map()
     saved = {"done": False}
 
     def save_map():
@@ -1938,7 +2059,10 @@ def main():
             txt = pending["cmd"].lower()
             k = resolve_target(txt)
             pending["cmd"] = None
-            if re.search(r"\b(map|explore|scan)\b", txt) and not k:
+            if re.search(r"\b(reset|forget|clear|wipe)\b", txt) and re.search(r"\b(map|room|memory)\b", txt):
+                m.reset_map()
+                print("Map wiped. The robot knows nothing about the room now.")
+            elif re.search(r"\b(map|explore|scan)\b", txt) and not k:
                 m.retarget(m.key, mode="map")
                 print("Mapping the whole room...")
             elif k:
@@ -1958,6 +2082,7 @@ def main():
         if m.outcome:
             settle += 1
             if settle == 1:
+                m.autosave(force=True)
                 if m.outcome == "MAPPED":
                     print("MAP SUMMARY:", m.wm.summary())
                     if args.save_map and not saved["done"]:
@@ -1977,6 +2102,10 @@ def main():
                 paused = not paused
             if k == ord("s"):
                 save_map()
+                m.autosave(force=True)
+            if k == ord("r"):
+                m.reset_map()
+                print("Map wiped (key r)")
             if k == ord("o"):                       # drop an unknown obstacle right in front of the car
                 x, y, yaw = sim.pose()
                 sim.add_obstacle(x + 1.0 * math.cos(yaw), y + 1.0 * math.sin(yaw), "crate")
