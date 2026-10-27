@@ -30,7 +30,8 @@ RMAX = 3.5                               # range sensor max distance
 CELL = 0.75                              # (legacy explorer) exploration-memory grid size (m)
 MRES = 0.15                              # room-map resolution: one map cell = 15 cm
 MN = int(round(ROOM / MRES))             # map is MN x MN cells
-MIN_GAIN, SPIN_GAIN = 120.0, 250.0         # map-explorer thresholds: smallest unsearched patch worth driving to / worth a 360-degree look
+MIN_GAIN, SPIN_GAIN = 120.0, 250.0
+MIN_GAIN_CELLS = 3.0                       # a viewpoint must reveal at least this much unsearched floor (tiny: exploration ends by exhaustion, not by a cut-off)         # map-explorer thresholds: smallest unsearched patch worth driving to / worth a 360-degree look
 VIS_R = 3.0                              # how far the camera is trusted to spot a can (m)
 ANGS = [math.radians(a) for a in range(-80, 81, 20)]   # 9 range sensors (hardware: servo-swept ultrasonic)
 SUBA = [math.radians(a) for a in (-8, -4, 0, 4, 8)]    # each sensor has a ~16 deg beam, like a real ultrasonic
@@ -671,6 +672,8 @@ class WorldMap:
         self.visits = np.zeros((MN, MN), np.float32)
         self.tg, self.sweep, self.bad, self.neg, self.sus = {}, 1, [], {}, {}
         self.room = None
+        self.dead = np.zeros((MN, MN), bool)               # unsearched cells nobody can see (walled off / out of range): not worth chasing
+        self.att = np.zeros((MN, MN), np.uint8)            # how many times we looked toward this cell without ever seeing it
         self.dist = self.prev = None
         k = np.arange(1, 24)                                                      # rays used to estimate "what would I see from there"
         th = np.linspace(0, 2 * math.pi, 48, endpoint=False)
@@ -824,6 +827,8 @@ class WorldMap:
 
     def new_sweep(self):
         self.seen[:] = False
+        self.dead[:] = False
+        self.att[:] = 0
         self.sweep += 1
         self.bad = []
 
@@ -900,6 +905,105 @@ class WorldMap:
     H8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]      # (d_col, d_row); heading h = h * 45 deg
 
     def astar(self, start, goal, yaw, hard=None, turn_rate=.9, turn_fixed=.12):
+        if os.environ.get("NAV_GRID"):
+            return self.astar_grid(start, goal, yaw, hard, turn_rate, turn_fixed)
+        """Theta* (any-angle A*). Same cost model as the grid planner below - driving TIME (slower near obstacles, +25 %
+        through unsearched cells, camera-hazard penalty) plus a turning cost - but a node's parent may be ANY cell it can
+        see in a straight, margin-respecting line, so routes are straight lines between a few waypoints instead of
+        8-direction staircases. Returns [(x, y), ...] or None."""
+        N = MN
+        hard = SAFE.hard if hard is None else hard
+        clear = self.clearance()
+        sr, sc = self.cell(*start)
+        gr, gc = self.cell(*goal)
+        hard = self._hard_eff = self.relaxed(hard, clear[sr, sc])
+        soft = hard + SAFE.soft_extra
+        blocked = clear < hard
+        blocked[max(0, sr - 1):sr + 2, max(0, sc - 1):sc + 2] = False
+        blocked[gr, gc] = False
+        known = (self.lo < -.05) | self.seen
+        spd = np.clip(V_MAX * (.3 + .7 * (clear - hard) / max(soft - hard, 1e-3)), .15, V_MAX)
+        tc = (np.where(known, MRES / spd, 1.25 * MRES / spd) * self.vision_penalty()).ravel().tolist()
+        bl = blocked.ravel().tolist()
+        vmax_inv = MRES / V_MAX
+        floor = math.floor
+
+        def los(r0, c0, r1, c1):
+            """Cost (s) of the straight line between two cell centres, or None if it touches a blocked cell."""
+            dr, dc = r1 - r0, c1 - c0
+            n = max(abs(dr), abs(dc))
+            step = math.hypot(dr, dc) / n
+            cost, pr, pc = 0.0, r0, c0
+            prev = tc[r0 * N + c0]
+            for i in range(1, n + 1):
+                r, c = floor(r0 + dr * i / n + .5), floor(c0 + dc * i / n + .5)
+                k = r * N + c
+                if bl[k] or (r != pr and c != pc and (bl[pr * N + c] or bl[r * N + pc])):
+                    return None                                                   # (diagonal moves may not cut a corner)
+                cost += .5 * (prev + tc[k]) * step
+                prev, pr, pc = tc[k], r, c
+            return cost
+
+        def turn_cost(a, b):
+            t = abs((b - a + math.pi) % (2 * math.pi) - math.pi)
+            return t / turn_rate + (turn_fixed if t > .25 else 0.0)
+
+        s0, goal_k = sr * N + sc, gr * N + gc
+        g, par, hd = {s0: 0.0}, {s0: s0}, {s0: float(yaw)}
+        pq, closed = [(math.hypot(gr - sr, gc - sc) * vmax_inv, s0)], set()
+        found = False
+        while pq:
+            _, u = heapq.heappop(pq)
+            if u in closed:
+                continue
+            closed.add(u)
+            if u == goal_k:
+                found = True
+                break
+            r, c = divmod(u, N)
+            p = par[u]
+            pr, pc = divmod(p, N)
+            gu = g[u]
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if not (dr or dc):
+                        continue
+                    rr, cc = r + dr, c + dc
+                    if not (0 <= rr < N and 0 <= cc < N):
+                        continue
+                    v = rr * N + cc
+                    if bl[v] or v in closed:
+                        continue
+                    diag = dr and dc
+                    if diag and (bl[r * N + cc] or bl[rr * N + c]):
+                        continue
+                    ang = math.atan2(dr, dc)
+                    best = gu + (tc[u] + tc[v]) * .5 * (1.414 if diag else 1.0) + turn_cost(hd[u], ang)
+                    bpar, bang = u, ang
+                    if p != u:                                                    # Theta*: try to hang v straight off u's parent
+                        cl = los(pr, pc, rr, cc)
+                        if cl is not None:
+                            ang2 = math.atan2(rr - pr, cc - pc)
+                            c2 = g[p] + cl + turn_cost(hd[p], ang2)
+                            if c2 < best:
+                                best, bpar, bang = c2, p, ang2
+                    if best < g.get(v, 1e9):
+                        g[v], par[v], hd[v] = best, bpar, bang
+                        heapq.heappush(pq, (best + math.hypot(gr - rr, gc - cc) * vmax_inv, v))
+        if not found:
+            return None
+        cells, k = [], goal_k
+        while True:
+            cells.append(self.centre(*divmod(k, N)))
+            if par[k] == k:
+                break
+            k = par[k]
+        cells = cells[::-1]
+        cells[0] = (float(start[0]), float(start[1]))
+        return self.densify(self.smooth(cells, hard, clear))
+
+    def astar_grid(self, start, goal, yaw, hard=None, turn_rate=.9, turn_fixed=.12):
+        """The original 8-direction grid planner over (cell, heading). Kept for comparison/tests."""
         """A* over (cell, heading). The cost is TIME in seconds:
              driving time  = distance / speed, where speed drops as the route gets closer to obstacles
            + turning time  = angle / turn_rate (+ a small fixed cost per turn, so straighter routes win)
@@ -1023,14 +1127,38 @@ class WorldMap:
         ix = np.clip(cols[:, None, None] + self.rx[None], 0, MN - 1)
         hit = occ[iy, ix]
         los = ~np.concatenate([np.zeros_like(hit[:, :, :1]), np.maximum.accumulate(hit, axis=2)[:, :, :-1]], axis=2)
-        new = los & ~self.seen[iy, ix] & ~hit
+        new = los & ~self.seen[iy, ix] & ~self.dead[iy, ix] & ~hit
         return (new * self.rw[None, None, :]).sum(axis=(1, 2))
 
+    def note_scan(self, x, y):
+        """We just did a full look from (x, y). Any unsearched cell it could see but still is not marked searched
+        (out of camera range, detector skipped frames...) gets a strike; two strikes and it stops attracting the
+        explorer. This is what guarantees the exploration terminates without re-scanning the same places."""
+        r, c = self.cell(x, y)
+        iy = np.clip(r + self.ry, 0, MN - 1)
+        ix = np.clip(c + self.rx, 0, MN - 1)
+        hit = (self.lo > 0.6)[iy, ix]
+        los = ~np.concatenate([np.zeros_like(hit[:, :1]), np.maximum.accumulate(hit, axis=1)[:, :-1]], axis=1)
+        m = los & ~hit & ~self.seen[iy, ix] & ~self.dead[iy, ix]
+        np.add.at(self.att, (iy[m], ix[m]), 1)
+        self.dead |= (self.att >= 2) & ~self.seen
+
+    def unsearched_reachable(self, hard):
+        """Reachable (from the last plan_from) floor cells nobody has looked at yet."""
+        u = (self.dist < 1e8) & ~self.seen & ~self.dead & (self.lo <= 0.6)
+        u[0, :] = u[-1, :] = u[:, 0] = u[:, -1] = False
+        return u
+
     def best_viewpoint(self, x, y, yaw=0.0, escape=False):
-        """Pick where to go next: lots of unsearched floor visible from there, and not too far to drive."""
-        for m in self.margins(escape):                    # try the comfortable margin first; squeeze only if it finds nothing
+        """Frontier choice. Look for the viewpoint that reveals the most unsearched floor per metre driven. There is NO
+        minimum-gain cut-off: exploration only ends when no reachable cell has an unsearched, visible neighbour left.
+        Cells that are unsearched but not visible from anywhere reachable are marked dead (reported, not chased)."""
+        for m in self.margins(escape):                    # comfortable margin first; squeeze only if that finds nothing
             self.plan_from(x, y, hard=m)
-            rr, cc = np.meshgrid(np.arange(1, MN - 1, 3), np.arange(1, MN - 1, 3), indexing="ij")
+            u = self.unsearched_reachable(m)
+            if not u.any():
+                continue
+            rr, cc = np.meshgrid(np.arange(1, MN - 1, int(os.environ.get("NAV_STRIDE", 3))), np.arange(1, MN - 1, int(os.environ.get("NAV_STRIDE", 3))), indexing="ij")
             rr, cc = rr.ravel(), cc.ravel()
             ok = self.dist[rr, cc] < 1e8
             for bx, by in self.bad:
@@ -1042,14 +1170,18 @@ class WorldMap:
             g = self.gain_at(rr, cc)
             d = self.dist[rr, cc]
             score = g / (EXP_D0 + EXP_DK * d ** EXP_P)
-            score[g < MIN_GAIN] = -1
-            for i in np.argsort(-score)[:25]:             # best candidates first: the first one A* can really reach wins
-                if score[i] <= 0:
-                    break
-                goal = self.centre(int(rr[i]), int(cc[i]))
-                path = self.astar((x, y), goal, yaw, hard=m)
-                if path:
-                    return path, float(g[i]), self._hard_eff
+            if (g >= MIN_GAIN_CELLS).sum() == 0:          # unsearched cells exist but nothing reachable can see them
+                self.dead |= u
+                continue
+            for floor_ in (MIN_GAIN, MIN_GAIN_CELLS):     # big unsearched patches first; only then the small leftovers
+                sc = np.where(g >= floor_, score, -1.0)
+                for i in np.argsort(-sc)[:25]:            # best candidates first: the first one A* can really reach wins
+                    if sc[i] <= 0:
+                        break
+                    goal = self.centre(int(rr[i]), int(cc[i]))
+                    path = self.astar((x, y), goal, yaw, hard=m)
+                    if path:
+                        return path, float(g[i]), self._hard_eff
         return None
 
     def nearest_roomy(self, x, y, yaw):
@@ -1063,6 +1195,34 @@ class WorldMap:
         goal = self.centre(int(r), int(c))
         path, m = self.route((x, y), yaw, goal)
         return (path, goal, m) if path else None
+
+    def approach_goal(self, x, y, tx, ty, standoff):
+        """Where to stop for an object at (tx, ty): the CHEAPEST reachable cell that sits `standoff`..`standoff`+0.45 m
+        from it and has a clear straight view of it. Cheapest = least driving time from here, so no circling."""
+        self.plan_from(x, y)
+        rr, cc = np.meshgrid(np.arange(1, MN - 1), np.arange(1, MN - 1), indexing="ij")
+        dd = np.hypot((cc + .5) * MRES - HALF - tx, (rr + .5) * MRES - HALF - ty)
+        reach = self.dist[rr, cc] < 1e8
+        ok = (dd >= standoff + .02) & (dd <= standoff + .45) & reach
+        if not ok.any():
+            ok = (dd >= standoff + .02) & (dd <= 2.0) & reach
+            if not ok.any():
+                return None
+        cost = np.where(ok, self.dist[rr, cc], 1e9).ravel()
+        obst = self.lo > 0.6
+        for k in np.argsort(cost)[:14]:
+            if cost[k] >= 1e9:
+                break
+            r, c = divmod(int(k), MN - 2)
+            gx, gy = self.centre(r + 1, c + 1)
+            n = max(2, int(math.hypot(tx - gx, ty - gy) / (MRES * .5)))       # straight view of the object? (ignore its own cell)
+            xs, ys = np.linspace(gx, tx, n)[:-2], np.linspace(gy, ty, n)[:-2]
+            ix = np.clip((xs + HALF) // MRES, 0, MN - 1).astype(int)
+            iy = np.clip((ys + HALF) // MRES, 0, MN - 1).astype(int)
+            if not obst[iy, ix].any():
+                return (gx, gy)
+        r, c = divmod(int(np.argmin(cost)), MN - 2)
+        return self.centre(r + 1, c + 1)
 
     def gain_here(self, x, y):
         r, c = self.cell(x, y)
@@ -1136,6 +1296,8 @@ class Brain:
     def reset(self):
         self.path, self.goal, self.go_t, self.go_pos, self.blocked_n = [], None, 0.0, (0, 0), 0
         self.go_yaw, self.stuck_why = 0.0, ""
+        self.avoid_since, self.route_floor = None, 0.0
+        self.ap_goal, self.ap_tgt, self.ap_t, self.ap_fail, self.in_approach = None, None, -99.0, -99.0, False
         self.replans, self.route_margin, self.replan_why, self.last_pt = 0, SAFE.hard, "", None
         self.rc_pending, self.recall_block, self.last_replan, self.spin_ok = None, -1.0, -99.0, False
         self.last_pick, self.look_t0, self.look_hold, self.recall_retry = -99.0, 0.0, None, 0
@@ -1213,6 +1375,11 @@ class Brain:
                     return 0.0, 0.0
                 self.state, self.note = "ALIGN", "centering on target"
                 return 0.0, float(np.sign(b) * max(.3, min(1.0, 1.8 * abs(b))))
+            if (not os.environ.get("NAV_NOAPP") and self.wm is not None and not self.map_only and d is not None and not tdet.get("dr")
+                    and self.standoff + .55 < d <= 2.6 and self.seen >= 2):   # far detections are too jumpy to plan on
+                ap = self._approach_step(tdet, pose, rng, now)
+                if ap is not None:
+                    return ap
             use = b                                # direction to steer toward (target, or a committed detour)
             if self.detour_until > now:
                 ahead = rng[int(np.argmin(np.abs(np.array(ANGS) - float(np.clip(b, -1.4, 1.4)))))]
@@ -1234,6 +1401,9 @@ class Brain:
         if tdet is not None:
             self.state, self.note = "VERIFY", "confirming detection"
             return 0.0, 0.0
+        if self.in_approach:                       # lost sight of it: drop the approach route, the search logic takes over
+            self.in_approach, self.ap_goal, self.path = False, None, []
+            self.phase, self.rc_pending, self.prev_yaw, self.last_pick = "PLAN", None, None, -99.0
         if self.tracked and now - self.last_seen_t <= 4.0:       # target hidden behind something: head to last known bearing
             g = wrap(self.goal_yaw - yaw)
             self.state, self.note = "REACQUIRE", "target lost, heading to last seen spot"
@@ -1254,6 +1424,13 @@ class Brain:
         self.path, self.goal, self.route_margin = path, goal, margin
         self.go_t, self.go_pos, self.blocked_n, self.last_replan, self.last_pt = now, pose[:2], 0, now, tuple(pose[:2])
         self.go_yaw = pose[2]
+        self._note_route_floor(path)
+
+    def _note_route_floor(self, path):
+        """Lowest clearance the freshly planned route itself has (a Theta* line may graze cells a bit tighter than the
+        nominal margin). The monitor only calls an 'obstacle on the route' when clearance falls BELOW that - i.e. it changed."""
+        clear = self.wm.clearance()
+        self.route_floor = min([clear[self.wm.cell(*q)] for q in path] + [9.0])
 
     def _replan(self, pose, now, why):
         """New A* route to the SAME goal from where the car is now, starting with its current heading (no needless U-turn)."""
@@ -1264,6 +1441,7 @@ class Brain:
             return False
         self.path, self.route_margin, self.replans, self.replan_why = path, m, self.replans + 1, why
         self.go_t, self.go_pos, self.last_pt, self.go_yaw = now, (x, y), (x, y), yaw
+        self._note_route_floor(path)
         return True
 
     @staticmethod
@@ -1289,7 +1467,7 @@ class Brain:
             for q in pts[:12]:
                 if math.hypot(q[0] - x, q[1] - y) > .5:
                     r_, c_ = wm.cell(*q)
-                    if clear[r_, c_] < .9 * self.route_margin:
+                    if clear[r_, c_] < min(.9 * self.route_margin, self.route_floor - .06):
                         why = "obstacle on the route"
                         break
             if why is None and self._cross_track(x, y, ([self.last_pt] if self.last_pt else []) + pts[:12]) > .5:
@@ -1305,22 +1483,84 @@ class Brain:
                 self.stuck_why = "no progress for 4 s"
                 return 0.0, 0.0, "stuck"                    # (turning in place IS progress; only no move AND no turn is stuck)
             self.go_t, self.go_pos, self.go_yaw = now, (x, y), yaw
-        look = next((q for q in pts if math.hypot(q[0] - x, q[1] - y) >= .6), pts[-1])
+        ld = .55                                            # pure-pursuit look-ahead distance (m)
+        look = next((q for q in pts if math.hypot(q[0] - x, q[1] - y) >= ld), pts[-1])
+        dl = math.hypot(look[0] - x, look[1] - y)
         g = wrap(math.atan2(look[1] - y, look[0] - x) - yaw)
         self.state = "EXPLORE"
+        left = sum(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip([(x, y)] + pts, pts))
+        self.note = f"{label}: {left:.1f} m to go | explored {wm.pct():.0f}% | replans {self.replans}"
         if abs(g) > 1.0:
             self.note = f"{label}: turning toward next waypoint"
             return 0.0, float(np.sign(g) * max(.5, min(1.4, 1.5 * abs(g)))), "go"
+        a_, r_ = np.array(ANGS), np.array(rng, dtype=float)
+        toward = np.abs(a_ - g) < .30                       # the sonar beams that look along the path
+        ahead = float(r_[toward].min()) if toward.any() else RMAX
+        push = 0.0                                          # side-clearance: the car's corners swing wider than the front ray
+        for ai, ri in zip(a_, r_):
+            lat, fwd = ri * abs(math.sin(ai)), ri * math.cos(ai)
+            if -.05 < fwd < .55 and lat < .30 and abs(ai) > .3:
+                push -= math.copysign((.30 - lat) / .20, ai)
+        if float(r_.min()) < .09:                            # touching / about to touch something with a flank: back off, turn away
+            k = int(np.argmin(r_))
+            self.blocked_n += 1
+            if self.blocked_n > 6:
+                self.blocked_n = 0
+                if not self._replan(pose, now, "blocked"):
+                    self.stuck_why = "blocked, no alternative route"
+                    return 0.0, 0.0, "stuck"
+            return -.15, float(-math.copysign(1.0, a_[k]) if abs(a_[k]) > .05 else 1.0), "go"
+        if (not os.environ.get("NAV_OLDPP") and ahead > max(SAFE.gap_min + .25, min(dl, 1.0))
+                and float(r_[np.abs(a_) <= .35].min()) >= 2 * SAFE.gap_min):
+            # ---- the planned way is open: FOLLOW THE GLOBAL ROUTE (pure pursuit), no local avoidance
+            self.avoid_since, self.blocked_n = None, 0
+            v = V_MAX * float(np.clip(1 - abs(g) / 1.3, .25, 1)) * float(np.clip(SAFE.v_safe(ahead) / V_MAX, .15, 1.0))
+            v *= float(np.clip(left / .8, .35, 1.0))        # ease off for the last stretch
+            w = 2.0 * v * math.sin(g) / max(dl, .3)         # pure-pursuit curvature
+            if abs(g) > .15:
+                w = math.copysign(max(abs(w), min(1.2 * abs(g), .8)), g)
+            w = float(np.clip(w + 1.2 * push, -W_MAX, W_MAX))
+            return v * (.6 if push else 1.0), w, "go"
+        # ---- something really is in the way: local avoidance, then REPLAN (do not keep wandering around it)
         v, w, tag = self.gap_steer(g, rng)
+        self.avoid_since = now if self.avoid_since is None else self.avoid_since
         self.blocked_n = self.blocked_n + 1 if tag in ("BLOCKED", "BACKUP") else 0
-        if self.blocked_n > 6:
-            self.blocked_n = 0
+        if self.blocked_n > 6 or now - self.avoid_since > 1.5:
+            self.blocked_n, self.avoid_since = 0, None
             if not self._replan(pose, now, "blocked"):
                 self.stuck_why = "blocked, no alternative route"
                 return 0.0, 0.0, "stuck"
-        left = sum(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(pts, pts[1:]))
-        self.note = f"{label}: {left:.1f} m to go | explored {wm.pct():.0f}% | replans {self.replans}"
+            self.note = f"{label}: blocked - re-planned around it"
         return v, w, "go"
+
+    def _approach_step(self, tdet, pose, rng, now):
+        """The target is in view with a distance: drive to a reachable stopping cell by the planned (Theta*) route
+        instead of steering at it and swerving round whatever is in between. Returns (v, w) or None -> legacy final approach."""
+        x, y, yaw = pose
+        b, d = tdet["bearing"], tdet["dist"]
+        tx, ty = x + CAM_FWD * math.cos(yaw) + d * math.cos(yaw + b), y + CAM_FWD * math.sin(yaw) + d * math.sin(yaw + b)
+        if now < self.ap_fail:
+            return None
+        if (self.ap_goal is None or not self.path or math.hypot(tx - self.ap_tgt[0], ty - self.ap_tgt[1]) > .35
+                or now - self.ap_t > 2.5):
+            goal = self.wm.approach_goal(x, y, tx, ty, self.standoff)
+            path, m = self.wm.route((x, y), yaw, goal) if goal else (None, None)
+            if not path:
+                self.ap_fail = now + 3.0
+                self.ap_goal = None
+                return None
+            self._set_route(path, goal, m, now, pose)
+            self.ap_goal, self.ap_tgt, self.ap_t, self.in_approach = goal, (tx, ty), now, True
+            self.phase, self.rc_pending = "PLAN", None      # the old search/recall goal is stale now
+        v, w, st = self._follow(pose, rng, now, "driving to the target by the planned route")
+        if st != "go":
+            if st == "stuck":
+                self.ap_fail = now + 3.0
+            self.ap_goal = None
+            return None
+        v *= float(np.clip((d - self.standoff) / (.6 + V_MAX * self.lat_est), .25, 1))   # brake earlier if vision is slow
+        self.state, self.note = "APPROACH", f"target {d:.2f} m away - route to a safe stopping spot"
+        return v, w
 
     def _search_map(self, rng, pose, now):
         x, y, yaw = pose
@@ -1397,6 +1637,7 @@ class Brain:
             if self.spin_acc < 2 * math.pi:
                 return 0.0, self.spin_w
             wm.bad.append((x, y))                           # looked all around from here: don't pick this spot again
+            wm.note_scan(x, y)
             if self.rc_pending:                             # looked all around and it is not there
                 if wm.miss(self.key, self.rc_pending):      # second failed visit: it was moved / false alarm
                     wm.new_sweep()                          # old "already searched" knowledge is stale now
