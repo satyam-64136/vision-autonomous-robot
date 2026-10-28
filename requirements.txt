@@ -1,0 +1,13 @@
+# SIGHTWAY runtime dependencies
+# Developed and tested with: Python 3.13, pybullet 3.2.7, numpy 2.5.3,
+# opencv-python 5.0.0.93, ultralytics 8.4.187. Older versions may work but are untested.
+pybullet>=3.2
+numpy>=1.24
+opencv-python>=4.8
+
+# Only needed for the AI detector (robot_det.pt) and for --collect / --train.
+# Without it the program falls back to the colour detector.
+ultralytics>=8.0
+
+# Optional: run the regression tests with pytest (they also run with plain `python test_nav.py`)
+# pytest
